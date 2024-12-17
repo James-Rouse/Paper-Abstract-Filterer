@@ -1,18 +1,24 @@
-from Bio import Entrez
+import os
+import requests
+import logging
 import pandas as pd
+from Bio import Entrez
 import nltk
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
 import string
-import os
 import time  # For rate limiting
 import arxiv
 from nltk.stem import PorterStemmer
 from Bio import Medline
-from Bio import Entrez
 from io import StringIO
 import threading
-import re
+from scholarly import scholarly
+import xml.etree.ElementTree as ET
+from tqdm import tqdm
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Define the custom nltk_data path
 nltk_data_path = r'C:\Users\wooot\nltk_data'
@@ -40,7 +46,7 @@ def search_pubmed(query, max_results=20000):
     Search PubMed with the given query and return search results.
     """
     try:
-        print(f"Searching PubMed for: {query}")
+        logging.info(f"Searching PubMed for: {query}")
         handle = Entrez.esearch(
             db="pubmed",
             term=query,
@@ -49,10 +55,10 @@ def search_pubmed(query, max_results=20000):
         )
         results = Entrez.read(handle)
         handle.close()
-        print(f"Number of articles found: {results['Count']}")
+        logging.info(f"Number of articles found: {results['Count']}")
         return results
     except Exception as e:
-        print(f"An error occurred during PubMed search: {e}")
+        logging.error(f"An error occurred during PubMed search: {e}")
         return None
 
 def fetch_pubmed_details(pubmed_results):
@@ -68,7 +74,6 @@ def fetch_pubmed_details(pubmed_results):
 
         for start in range(0, len(id_list), batch_size):
             end = min(start + batch_size, len(id_list))
-            print(f"Fetching records {start + 1} to {end}")
             fetch_handle = Entrez.efetch(
                 db="pubmed",
                 rettype="medline",
@@ -80,93 +85,103 @@ def fetch_pubmed_details(pubmed_results):
             )
             data = fetch_handle.read()
             fetch_handle.close()
-
-            # Correctly parse Medline data using StringIO
-            records = list(Medline.parse(StringIO(data)))
-            
-            for record in records:
-                article = {
-                    'Title': record.get('TI', ''),
-                    'Abstract': record.get('AB', ''),
-                    'Authors': ', '.join(record.get('AU', [])),
-                    'PublicationDate': record.get('DP', ''),
-                    'DOI': record.get('LID', '').replace(' [doi]', ''),
-                    'Source': 'PubMed'
-                }
-                articles.append(article)
-            time.sleep(0.5)  # Respect rate limits
+            articles.extend(list(Medline.parse(StringIO(data))))
+            logging.info(f"Fetching records {start + 1} to {end}")
         return articles
     except Exception as e:
-        print(f"An error occurred while fetching PubMed details: {e}")
+        logging.error(f"An error occurred while fetching PubMed details: {e}")
         return []
+
+def fetch_all_arxiv_articles(query, total_results=208483, batch_size=100):
+    """
+    Fetch all articles from arXiv based on the query with enhanced logging and progress tracking.
+    
+    Args:
+        query (str): The search query.
+        total_results (int): Total number of results to fetch.
+        batch_size (int): Number of results per request.
+        
+    Returns:
+        list: A list of dictionaries containing article details.
+    """
+    arxiv_articles = []
+    start = 0
+    retries = 3  # Number of retries for failed requests
+
+    with tqdm(total=total_results, desc="Fetching arXiv Articles") as pbar:
+        while start < total_results:
+            attempt = 0
+            success = False
+            while attempt < retries and not success:
+                try:
+                    logging.info(f"Requesting page: Start={start}, Max Results={batch_size}")
+                    search_query = f"{query} start={start} max_results={batch_size}"
+                    search = arxiv.Search(
+                        query=search_query,
+                        max_results=batch_size,
+                        sort_by=arxiv.SortCriterion.Relevance
+                    )
+
+                    batch = []
+                    for result in search.results():
+                        arxiv_article = {
+                            'Title': result.title,
+                            'Authors': ', '.join([author.name for author in result.authors]),
+                            'Abstract': result.summary,
+                            'PublicationDate': result.published.strftime('%Y-%m-%d'),
+                            'DOI': result.doi if result.doi else '',
+                            'Source': 'arXiv'
+                        }
+                        batch.append(arxiv_article)
+
+                    if not batch:
+                        logging.info("No more articles found. Ending fetch.")
+                        success = True
+                        break
+
+                    arxiv_articles.extend(batch)
+                    pbar.update(len(batch))
+                    logging.info(f"Fetched {len(batch)} articles. Total so far: {len(arxiv_articles)}")
+
+                    # Increment start for next batch
+                    start += batch_size
+
+                    # Sleep to respect arXiv's rate limits (e.g., 3 seconds between requests)
+                    sleep_duration = 3
+                    logging.info(f"Sleeping for {sleep_duration} seconds to respect rate limits.")
+                    time.sleep(sleep_duration)
+
+                    success = True  # Exit retry loop
+
+                except Exception as e:
+                    attempt += 1
+                    logging.error(f"Attempt {attempt} failed: {e}")
+                    logging.info(f"Retrying after sleep. Attempt {attempt} of {retries}.")
+                    time.sleep(5)  # Sleep before retrying
+
+            if not success:
+                logging.error(f"Failed to fetch batch starting at {start} after {retries} attempts. Skipping to next batch.")
+                start += batch_size
+                pbar.update(batch_size)  # Skip updating for failed batch
+
+    return arxiv_articles
 
 def validate_full_text(paper):
     """
-    Check specific details in the paper such as brain scans, lesions, and confounding factors.
+    Validate if the paper meets the full-text criteria.
+    
+    Args:
+        paper (dict): A dictionary containing paper details.
+        
+    Returns:
+        bool: True if the paper meets the criteria, False otherwise.
     """
-    abstract = paper.get('Abstract', '').lower()
-    title = paper.get('Title', '').lower()
-    combined_text = title + " " + abstract
-
-    brain_scan_keywords = ["mri", "ct", "brain scan"]
-    lesion_keywords = ["lesion", "clear lesion"]
-    confounding_keywords = ["toxic", "drug-induced", "metabolic", "physiologic", "pharmacological"]
-
-    # Verify presence of brain scan
-    has_brain_scan = any(keyword in combined_text for keyword in brain_scan_keywords)
-    # Verify presence of lesion clarity
-    has_lesion = any(keyword in combined_text for keyword in lesion_keywords)
-    # Exclude if confounding factors are present
-    has_confounding = any(keyword in combined_text for keyword in confounding_keywords)
-
-    return has_brain_scan and has_lesion and not has_confounding
-
-def search_arxiv(query, max_results=500):
-    """
-    Search arXiv with the given query and return search results as a list of dictionaries.
-    """
-    try:
-        print(f"Searching arXiv for: {query}")
-        client = arxiv.Client(page_size=100, delay_seconds=2)  # Adjust delay_seconds and limit max_results
-        search = arxiv.Search(
-            query=query,
-            max_results=max_results,
-            sort_by=arxiv.SortCriterion.Relevance
-        )
-        arxiv_articles = []
-        for result in client.results(search):
-            arxiv_article = {
-                'Title': result.title,
-                'Abstract': result.summary,
-                'Authors': ', '.join([author.name for author in result.authors]),
-                'PublicationDate': result.published.strftime('%Y-%m-%d'),
-                'DOI': result.doi or '',
-                'Source': 'arXiv'
-            }
-            arxiv_articles.append(arxiv_article)
-        print(f"Number of arXiv articles found: {len(arxiv_articles)}")
-        return arxiv_articles
-    except Exception as e:
-        print(f"An error occurred during arXiv search: {e}")
-        return []
-
-def search_arxiv_with_timeout(query, max_results=500, timeout=30):
-    """
-    Search arXiv with a timeout to prevent hanging indefinitely.
-    """
-    result = []
-
-    def search():
-        nonlocal result
-        result = search_arxiv(query, max_results)
-
-    thread = threading.Thread(target=search)
-    thread.start()
-    thread.join(timeout)  # Join the thread with a timeout
-    if thread.is_alive():
-        print("arXiv search timed out.")
-        return []
-    return result
+    # Placeholder implementation - modify based on your criteria
+    required_fields = ['Title', 'Authors', 'Abstract', 'PublicationDate']
+    for field in required_fields:
+        if field not in paper or not paper[field]:
+            return False
+    return True
 
 def filter_papers(papers, inclusion_keywords, exclusion_keywords, verbose=False):
     """
@@ -213,7 +228,7 @@ if __name__ == "__main__":
         print("No PubMed articles found.")
 
     # arXiv Search
-    arxiv_articles = search_arxiv_with_timeout("delusion brain imaging MRI CT", max_results=500, timeout=30)
+    arxiv_articles = fetch_all_arxiv_articles(search_query, total_results=208483, batch_size=100)
     if arxiv_articles:
         print(f"Number of arXiv articles retrieved: {len(arxiv_articles)}")
     else:
@@ -225,7 +240,12 @@ if __name__ == "__main__":
     print(f"Total number of articles retrieved: {len(articles)}")
 
     if articles:
-        filtered_papers = filter_papers(articles, inclusion_keywords=inclusion_criteria, exclusion_keywords=exclusion_criteria, verbose=False)
+        filtered_papers = filter_papers(
+            articles,
+            inclusion_keywords=inclusion_criteria,
+            exclusion_keywords=exclusion_criteria,
+            verbose=False
+        )
         if filtered_papers:
             save_results_to_csv(filtered_papers)
             print(f"{len(filtered_papers)} papers match the criteria.")
