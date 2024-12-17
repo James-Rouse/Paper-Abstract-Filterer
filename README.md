@@ -219,5 +219,3 @@ This project is licensed under the MIT License.
 ## Contact
 
 For any questions or suggestions, please contact [James Thomas Rouse](mailto:james.thomas.rouse@gmail.com).
-
-```
